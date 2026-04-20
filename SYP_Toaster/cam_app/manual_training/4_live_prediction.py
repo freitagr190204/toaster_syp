@@ -1,19 +1,30 @@
 """
-Skript 4: Live Toast-Erkennung mit trainiertem Modell
+Live Toast-Erkennung + Shelly Plug S Auto-Abschaltung
 =====================================================
-Nutzt das trainierte CNN für Echtzeit-Vorhersagen.
+Kamera schaut durch Glasfenster in den Toaster.
+Du wählst per Taste [1]-[5] wie braun dein Toast werden soll,
+drückst den Toaster-Hebel runter, und sobald die Zielstufe
+stabil erkannt wird, schaltet der Shelly Plug S den Strom ab
+→ Toast wird ausgeworfen.
 
-Workflow: recording.py -> 1_crop_images.py -> 2_label_images.py -> 3_train_model.py -> 4_live_prediction.py
+Steuerung:
+  [1]-[5]      Zielstufe wählen (1=roh … 5=verbrannt)
+  [LEERTASTE]  Neue Session starten (Reset Trigger, Shelly EIN)
+  [O] / [F]    Shelly manuell EIN / AUS
+  [G]          Anzeige Farbe ↔ S/W
+  [R]          Trigger zurücksetzen
+  [ESC]        Beenden
+
+Workflow: recording.py → 1_crop_images.py → 2_label_images.py → 3_train_model.py → 4_live_prediction.py
 """
 
 import argparse
+import sys
 import cv2
 import json
 import torch
-import torch.nn as nn
 import numpy as np
 from pathlib import Path
-import sys
 import time
 import urllib.error
 import urllib.parse
@@ -22,7 +33,11 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 # ================= PFADE =================
-BASE_DIR = Path(__file__).parent.parent
+BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+import toast_net
+
 MODELS_DIR = BASE_DIR / "models"
 MODEL_PATH = MODELS_DIR / "toast_model.pt"
 
@@ -31,31 +46,29 @@ IMG_SIZE = 224
 CLASSES = ['roh', 'leicht', 'perfekt', 'dunkel', 'verbrannt']
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# ================= EINSTELLUNGEN =================
 BOX_WIDTH = 550
 BOX_HEIGHT = 450
 
-# Farben für Klassen (BGR)
 CLASS_COLORS = {
-    'roh': (200, 200, 200),      # Grau
-    'leicht': (0, 255, 255),     # Gelb
-    'perfekt': (0, 255, 0),      # Grün
-    'dunkel': (0, 165, 255),     # Orange
-    'verbrannt': (0, 0, 255)     # Rot
+    'roh':       (200, 200, 200),
+    'leicht':    (0, 255, 255),
+    'perfekt':   (0, 255, 0),
+    'dunkel':    (0, 165, 255),
+    'verbrannt': (0, 0, 255),
 }
 
-CLASS_EMOJIS = {
-    'roh': '🍞 ROH',
-    'leicht': '🥪 LEICHT',
-    'perfekt': '✅ PERFEKT!',
-    'dunkel': '🔥 DUNKEL',
-    'verbrannt': '💀 VERBRANNT'
+CLASS_LABELS = {
+    'roh':       '1: ROH',
+    'leicht':    '2: LEICHT',
+    'perfekt':   '3: PERFEKT',
+    'dunkel':    '4: DUNKEL',
+    'verbrannt': '5: VERBRANNT',
 }
 
-# ================= SHELLY (PLUG S / Gen1) =================
+# ================= SHELLY PLUG S =================
 @dataclass(frozen=True)
 class ShellyConfig:
-    host: str  # z.B. "192.168.178.50"
+    host: str
     relay: int = 0
     username: Optional[str] = None
     password: Optional[str] = None
@@ -63,12 +76,7 @@ class ShellyConfig:
 
 
 class ShellyClient:
-    """
-    Shelly Plug S HTTP API:
-      - Gen1:  GET http://<host>/relay/0?turn=on|off
-      - Gen2:  GET http://<host>/rpc/Switch.Set?id=0&on=true|false
-    Optional HTTP Basic Auth (wenn im Shelly gesetzt).
-    """
+    """Shelly Plug S HTTP API (Gen1 + Gen2 fallback)."""
 
     def __init__(self, cfg: ShellyConfig):
         self.cfg = cfg
@@ -76,48 +84,33 @@ class ShellyClient:
     def _add_auth(self, req: urllib.request.Request) -> None:
         if self.cfg.username and self.cfg.password is not None:
             import base64
-
             token = f"{self.cfg.username}:{self.cfg.password}".encode("utf-8")
             req.add_header("Authorization", "Basic " + base64.b64encode(token).decode("ascii"))
 
-    def _build_request_gen1(self, turn: str) -> urllib.request.Request:
-        url = f"http://{self.cfg.host}/relay/{self.cfg.relay}?turn={urllib.parse.quote(turn)}"
-        req = urllib.request.Request(url, method="GET")
-        self._add_auth(req)
-        return req
-
-    def _build_request_gen2(self, on: bool) -> urllib.request.Request:
-        # Shelly Gen2 / Plus API
-        on_str = "true" if on else "false"
-        url = f"http://{self.cfg.host}/rpc/Switch.Set?id={self.cfg.relay}&on={on_str}"
-        req = urllib.request.Request(url, method="GET")
-        self._add_auth(req)
-        return req
-
     def set_power(self, on: bool) -> Tuple[bool, str]:
         turn = "on" if on else "off"
-        # 1) Versuche klassische Gen1-API
-        req1 = self._build_request_gen1(turn)
+        # Gen1: /relay/0?turn=on|off
+        url1 = f"http://{self.cfg.host}/relay/{self.cfg.relay}?turn={turn}"
+        req1 = urllib.request.Request(url1, method="GET")
+        self._add_auth(req1)
         try:
             with urllib.request.urlopen(req1, timeout=self.cfg.timeout_s) as resp:
-                body = resp.read().decode("utf-8", errors="replace")
-            return True, body
+                return True, resp.read().decode("utf-8", errors="replace")
         except Exception as e1:
-            # 2) Fallback: Gen2-/rpc-API probieren
-            req2 = self._build_request_gen2(on)
-            try:
-                with urllib.request.urlopen(req2, timeout=self.cfg.timeout_s) as resp:
-                    body = resp.read().decode("utf-8", errors="replace")
-                return True, body
-            except Exception as e2:
-                return False, f"Gen1-Fehler: {e1}; Gen2-Fehler: {e2}"
+            pass
+        # Gen2: /rpc/Switch.Set?id=0&on=true|false
+        on_str = "true" if on else "false"
+        url2 = f"http://{self.cfg.host}/rpc/Switch.Set?id={self.cfg.relay}&on={on_str}"
+        req2 = urllib.request.Request(url2, method="GET")
+        self._add_auth(req2)
+        try:
+            with urllib.request.urlopen(req2, timeout=self.cfg.timeout_s) as resp:
+                return True, resp.read().decode("utf-8", errors="replace")
+        except Exception as e2:
+            return False, f"Gen1: {e1}; Gen2: {e2}"
 
 
 def load_shelly_config() -> Optional[ShellyConfig]:
-    """
-    Lädt `shelly_config.json` aus dem Projekt-Root (cam_app/).
-    Beispiel siehe `shelly_config.example.json`.
-    """
     cfg_path = BASE_DIR / "shelly_config.json"
     if not cfg_path.exists():
         return None
@@ -129,349 +122,274 @@ def load_shelly_config() -> Optional[ShellyConfig]:
         return ShellyConfig(
             host=host,
             relay=int(data.get("relay", 0)),
-            username=(str(data["username"]) if "username" in data and str(data["username"]).strip() else None),
-            password=(str(data["password"]) if "password" in data and data["password"] is not None else None),
+            username=(str(data["username"]) if data.get("username") else None),
+            password=(str(data["password"]) if data.get("password") else None),
             timeout_s=float(data.get("timeout_s", 2.0)),
         )
     except Exception:
         return None
 
 
-# ================= CNN MODELL (kopiert aus 3_train_model.py) =================
-class ToastCNN(nn.Module):
-    """Einfaches CNN für Toast-Klassifikation"""
-    def __init__(self, num_classes=5):
-        super(ToastCNN, self).__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1), nn.BatchNorm2d(32), nn.ReLU(inplace=True), nn.MaxPool2d(2, 2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1), nn.BatchNorm2d(64), nn.ReLU(inplace=True), nn.MaxPool2d(2, 2),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1), nn.BatchNorm2d(128), nn.ReLU(inplace=True), nn.MaxPool2d(2, 2),
-            nn.Conv2d(128, 256, kernel_size=3, padding=1), nn.BatchNorm2d(256), nn.ReLU(inplace=True), nn.MaxPool2d(2, 2),
-            nn.Conv2d(256, 512, kernel_size=3, padding=1), nn.BatchNorm2d(512), nn.ReLU(inplace=True), nn.MaxPool2d(2, 2),
-        )
-        self.classifier = nn.Sequential(
-            nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten(), nn.Dropout(0.5),
-            nn.Linear(512, 256), nn.ReLU(inplace=True), nn.Dropout(0.3), nn.Linear(256, num_classes)
-        )
-    def forward(self, x):
-        return self.classifier(self.features(x))
-
-# ================= MODELL LADEN =================
+# ================= MODELL =================
 def load_model():
-    """Lädt das trainierte Modell"""
     if not MODEL_PATH.exists():
-        print(f"❌ Modell nicht gefunden: {MODEL_PATH}")
-        print("   Bitte zuerst Skript 3 (3_train_model.py) ausführen!")
+        print(f"Modell nicht gefunden: {MODEL_PATH}")
+        print("   Bitte zuerst 3_train_model.py ausfuehren!")
         return None
-    
     checkpoint = torch.load(MODEL_PATH, map_location=device, weights_only=False)
-    model = ToastCNN(num_classes=len(CLASSES)).to(device)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    if checkpoint.get("arch") != "resnet18":
+        print("Altes toast_model.pt (Custom-CNN) ist nicht kompatibel.")
+        print("   Bitte neu trainieren: python manual_training/3_train_model.py")
+        return None
+    model = toast_net.build_toast_classifier(len(CLASSES), pretrained_backbone=False).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
-    
-    print(f"✅ Modell geladen (Accuracy: {checkpoint['accuracy']:.1f}%)")
+    print(f"ResNet18 geladen (Val-Accuracy beim Training: {checkpoint['accuracy']:.1f}%)")
     return model
+
 
 # ================= KAMERA =================
 def init_camera(preferred_ids=None):
-    """
-    Initialisiert die Kamera.
-    - Wenn preferred_ids gesetzt ist, werden genau diese IDs in dieser Reihenfolge probiert.
-    - Sonst Standard-Reihenfolge: [1, 0, 2] (extern, intern, weitere).
-    """
     if preferred_ids is None or len(preferred_ids) == 0:
         preferred_ids = [1, 0, 2]
-
     print(f"Suche Kamera (Reihenfolge: {preferred_ids})...")
     for idx in preferred_ids:
         cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
         if cap.isOpened():
-            ret, frame = cap.read()
+            ret, _ = cap.read()
             if ret:
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
                 cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
-                print(f"✅ Kamera {idx} bereit!")
+                print(f"Kamera {idx} bereit!")
                 return cap
         cap.release()
-    print("❌ Keine Kamera gefunden!")
+    print("Keine Kamera gefunden!")
     return None
+
 
 # ================= VORHERSAGE =================
 def predict(model, roi):
-    """Macht Vorhersage für ROI"""
-    # Bild vorbereiten
     img = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
     img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
     img = img.astype(np.float32) / 255.0
     img = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(device)
-    
-    # Vorhersage
+    img = toast_net.normalize_imagenet(img)
     with torch.no_grad():
         outputs = model(img)
         probs = torch.softmax(outputs, dim=1)
         pred_idx = torch.argmax(probs, dim=1).item()
         confidence = probs[0][pred_idx].item() * 100
-    
     probs_np = probs[0].cpu().numpy()
     expected_state = float(np.sum(np.arange(len(CLASSES), dtype=np.float32) * probs_np))
-    return CLASSES[pred_idx], pred_idx, confidence, probs_np, expected_state
+    return pred_idx, confidence, probs_np, expected_state
+
+
+def target_reached(target_idx: int, pred_idx: int, expected_state: float, confidence: float, min_conf: float) -> bool:
+    """
+    Returns True when the toast has reached (or passed) the chosen target level.
+    - target 0 (roh):       pred >= 0 and expected >= 0.0  (basically always, but still need confidence)
+    - target 1 (leicht):    expected >= 0.8
+    - target 2 (perfekt):   expected >= 1.8
+    - target 3 (dunkel):    expected >= 2.8
+    - target 4 (verbrannt): expected >= 3.5
+    """
+    thresholds = [0.0, 0.8, 1.8, 2.8, 3.5]
+    if confidence < min_conf:
+        return False
+    return expected_state >= thresholds[target_idx]
+
 
 # ================= HAUPTPROGRAMM =================
 def main():
-    parser = argparse.ArgumentParser(description="Live Toast-Erkennung (+ optional Shelly Auto-Off)")
-    parser.add_argument("--level", type=int, default=3, help="Ziel-Bräunestufe 1-5 (1=roh ... 5=verbrannt). Default: 3")
-    parser.add_argument("--min-conf", type=float, default=70.0, help="Min. Konfidenz (%%) fürs Auslösen. Default: 70")
-    parser.add_argument("--stable-frames", type=int, default=12, help="Wie viele Frames am Stück Ziel erreicht sein muss. Default: 12")
-    parser.add_argument("--shelly-host", type=str, default=None, help='Shelly Host/IP, z.B. "192.168.178.50". Überschreibt shelly_config.json')
-    parser.add_argument("--shelly-relay", type=int, default=None, help="Shelly Relay (meist 0). Überschreibt shelly_config.json")
-    parser.add_argument("--shelly-user", type=str, default=None, help="Optional Shelly Username (Basic Auth)")
-    parser.add_argument("--shelly-pass", type=str, default=None, help="Optional Shelly Passwort (Basic Auth)")
-    parser.add_argument("--camera-id", type=int, default=None, help="Feste Kamera-ID (z.B. 1 für USB-Kamera). Wenn gesetzt, wird nur diese ID verwendet.")
+    parser = argparse.ArgumentParser(description="Live Toast-Erkennung + Shelly Auto-Off")
+    parser.add_argument("--level", type=int, default=3, help="Ziel-Stufe 1-5 (1=roh..5=verbrannt). Default: 3 (perfekt)")
+    parser.add_argument("--min-conf", type=float, default=65.0, help="Min. Konfidenz (%%) Default: 65")
+    parser.add_argument("--stable-frames", type=int, default=10, help="Stabile Frames bevor Strom aus. Default: 10")
+    parser.add_argument("--camera-id", type=int, default=None, help="Kamera-ID (z.B. 1 fuer USB)")
+    parser.add_argument("--shelly-host", type=str, default=None, help="Shelly IP (ueberschreibt shelly_config.json)")
     args = parser.parse_args()
 
-    print("="*50)
-    print("🍞 LIVE TOAST-ERKENNUNG")
-    print("="*50)
-    
-    # Modell laden
+    print("=" * 55)
+    print("    TOAST AI - Automatische Braeunungserkennung")
+    print("=" * 55)
+
     model = load_model()
     if model is None:
         return
-    
-    # Kamera starten
-    if args.camera_id is not None:
-        cap = init_camera([args.camera_id])
-    else:
-        cap = init_camera()
+
+    cap = init_camera([args.camera_id] if args.camera_id is not None else None)
     if cap is None:
         return
-    
-    print("\nSteuerung:")
-    print(" [ESC] - Beenden")
-    print(" [1]-[5] - Zielstufe setzen (roh..verbrannt)")
-    print(" [A] - Auto-Off (Shelly) an/aus")
-    print(" [LEERTASTE] - (wenn Auto-Off an) Session starten: Shelly EIN + Trigger reset")
-    print(" [O] - Shelly EIN (manuell)")
-    print(" [F] - Shelly AUS (manuell)")
-    print(" [R] - Trigger zurücksetzen (erneut auslösen erlauben)")
-    print(" [G] - Anzeige: Farbe <-> S/W")
-    print("="*50)
 
-    # Zielstufe 1..5 -> Index 0..4
-    target_idx = int(np.clip(args.level, 1, 5)) - 1
-
-    # Shelly Config (optional)
+    # Shelly
     shelly_cfg = load_shelly_config()
     if args.shelly_host:
-        shelly_cfg = ShellyConfig(
-            host=args.shelly_host.strip(),
-            relay=int(args.shelly_relay) if args.shelly_relay is not None else (shelly_cfg.relay if shelly_cfg else 0),
-            username=args.shelly_user,
-            password=args.shelly_pass,
-            timeout_s=(shelly_cfg.timeout_s if shelly_cfg else 2.0),
-        )
+        shelly_cfg = ShellyConfig(host=args.shelly_host.strip())
     shelly: Optional[ShellyClient] = ShellyClient(shelly_cfg) if shelly_cfg else None
 
-    # Auto-Modus: Strom automatisch EIN beim Start (falls Shelly konfiguriert),
-    # und automatisch AUS schalten, wenn der Toast zwischen Stufe 3 ("perfekt")
-    # und 4 ("dunkel") liegt (kontinuierlicher Erwartungswert zwischen 2.5 und 3.5).
-    auto_off_enabled = shelly is not None
-    session_active = auto_off_enabled
-    consecutive_reached = 0
+    # State
+    target_idx = int(np.clip(args.level, 1, 5)) - 1
+    min_conf = float(args.min_conf)
+    stable_needed = int(args.stable_frames)
+    consecutive = 0
     power_off_sent = False
-    if shelly is None:
-        last_shelly_status = "Shelly: nicht konfiguriert"
-    else:
-        ok, msg = shelly.set_power(True)
-        last_shelly_status = "Shelly: EIN ✅ (Auto-Start)" if ok else f"Shelly ON Fehler: {msg}"
-    session_started_at = None
+    session_active = False
     grayscale_mode = False
-    
+    shelly_status = "Shelly: nicht konfiguriert" if shelly is None else "Shelly: bereit"
+
+    print()
+    print("Steuerung:")
+    print("  [1]-[5]      Zielstufe waehlen")
+    print("  [LEERTASTE]  Session starten (Shelly EIN + Reset)")
+    print("  [O] / [F]    Shelly manuell EIN / AUS")
+    print("  [G]          Farbe / S/W")
+    print("  [R]          Trigger reset")
+    print("  [ESC]        Beenden")
+    print("=" * 55)
+
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        
-        # Original für CNN behalten
+
         color_frame = frame
         h, w = color_frame.shape[:2]
-        
-        # ROI berechnen (leicht nach unten versetzt)
-        center_x, center_y = w // 2, h // 2 + 50
-        x1 = center_x - BOX_WIDTH // 2
-        y1 = center_y - BOX_HEIGHT // 2
-        x2 = center_x + BOX_WIDTH // 2
-        y2 = center_y + BOX_HEIGHT // 2
-        
-        # ROI extrahieren und Vorhersage machen
-        roi = color_frame[y1:y2, x1:x2]
-        pred_class, pred_idx, confidence, all_probs, expected_state = predict(model, roi)
-        
-        # Frame für Anzeige vorbereiten (optional S/W)
+
+        # ROI (centered, slightly below middle for typical toaster view)
+        cx, cy = w // 2, h // 2 + 50
+        x1, y1 = cx - BOX_WIDTH // 2, cy - BOX_HEIGHT // 2
+        x2, y2 = cx + BOX_WIDTH // 2, cy + BOX_HEIGHT // 2
+
+        roi = color_frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+        pred_idx, confidence, all_probs, expected_state = predict(model, roi)
+        pred_class = CLASSES[pred_idx]
+
+        # Display frame (optionally grayscale)
         if grayscale_mode:
             gray = cv2.cvtColor(color_frame, cv2.COLOR_BGR2GRAY)
             frame = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
         else:
             frame = color_frame.copy()
 
-        # Farbe basierend auf Vorhersage
         color = CLASS_COLORS[pred_class]
-        
-        # ROI-Rahmen zeichnen
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-        
-        # Vorhersage anzeigen
-        label = CLASS_EMOJIS[pred_class]
-        cv2.putText(frame, f"{label}", (x1, y1 - 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
-        cv2.putText(frame, f"Konfidenz: {confidence:.1f}%", (x1, y1 - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        
-        # Target/Auto-Off Status Overlay
         target_name = CLASSES[target_idx]
         target_color = CLASS_COLORS[target_name]
-        status_y = y2 + 85
-        cv2.putText(frame, f"Auto-Modus: AUS wenn 'perfekt'/'dunkel' mit >80% erkannt", (x1, status_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, target_color, 2)
-        status_y += 25
-        cv2.putText(frame, f"Auto-Off: {'AN' if auto_off_enabled else 'AUS'} | Session: {'AKTIV' if session_active else 'STOP'} | Erwartungswert: {expected_state:.2f}",
-                    (x1, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-        status_y += 22
-        cv2.putText(frame, f"{last_shelly_status}", (x1, status_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
-        # Balkendiagramm für alle Klassen
-        bar_x = x2 + 30
-        bar_width = 150
-        bar_height = 25
-        
+        # ROI box
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+
+        # Prediction label
+        cv2.putText(frame, f"{CLASS_LABELS[pred_class]}  {confidence:.0f}%", (x1, y1 - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+
+        # ---- Right side: probability bars ----
+        bar_x = x2 + 25
+        bar_w = 160
+        bar_h = 28
         cv2.putText(frame, "Vorhersage:", (bar_x, y1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        
+
         for i, (cls, prob) in enumerate(zip(CLASSES, all_probs)):
-            y_pos = y1 + 20 + i * (bar_height + 10)
-            
-            # Hintergrund
-            cv2.rectangle(frame, (bar_x, y_pos), 
-                         (bar_x + bar_width, y_pos + bar_height),
-                         (50, 50, 50), -1)
-            
-            # Füllbalken
-            fill_width = int(prob * bar_width)
-            bar_color = CLASS_COLORS[cls]
-            cv2.rectangle(frame, (bar_x, y_pos),
-                          (bar_x + fill_width, y_pos + bar_height),
-                          bar_color, -1)
-            
-            # Label
-            cv2.putText(frame, f"{cls}: {prob*100:.0f}%", 
-                       (bar_x + 5, y_pos + 18),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-
-            # Markiere Zielklasse
+            by = y1 + 15 + i * (bar_h + 8)
+            cv2.rectangle(frame, (bar_x, by), (bar_x + bar_w, by + bar_h), (50, 50, 50), -1)
+            fill = int(prob * bar_w)
+            cv2.rectangle(frame, (bar_x, by), (bar_x + fill, by + bar_h), CLASS_COLORS[cls], -1)
+            cv2.putText(frame, f"{cls}: {prob*100:.0f}%", (bar_x + 5, by + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
             if i == target_idx:
-                cv2.rectangle(frame, (bar_x - 3, y_pos - 3), (bar_x + bar_width + 3, y_pos + bar_height + 3), (255, 255, 255), 1)
-        
-        # Auto-Off Logik (nur wenn Session aktiv)
-        if session_active and auto_off_enabled:
-            # Ausschalten, wenn Klasse "perfekt" ODER "dunkel" mit hoher Sicherheit erkannt wird.
-            # Klassenindizes: 0=roh, 1=leicht, 2=perfekt, 3=dunkel, 4=verbrannt
-            # → Bedingung: pred_class in {'perfekt','dunkel'} UND Konfidenz >= 80%
-            conf_threshold = max(float(args.min_conf), 80.0)
-            reached = (pred_class in ('perfekt', 'dunkel')) and (confidence >= conf_threshold)
+                cv2.rectangle(frame, (bar_x - 2, by - 2), (bar_x + bar_w + 2, by + bar_h + 2), (255, 255, 255), 2)
+
+        # ---- Bottom: status info ----
+        info_y = y2 + 30
+        cv2.putText(frame, f"ZIEL: {CLASS_LABELS[target_name]}  [Taste 1-5 zum aendern]", (x1, info_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, target_color, 2)
+        info_y += 28
+        session_txt = "AKTIV" if session_active else "WARTE (Leertaste)"
+        cv2.putText(frame, f"Session: {session_txt}  |  Erwartungswert: {expected_state:.2f}", (x1, info_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+        info_y += 22
+        cv2.putText(frame, shelly_status, (x1, info_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+        # ---- Auto-off logic ----
+        if session_active and not power_off_sent:
+            reached = target_reached(target_idx, pred_idx, expected_state, confidence, min_conf)
             if reached:
-                consecutive_reached += 1
+                consecutive += 1
             else:
-                consecutive_reached = 0
+                consecutive = 0
 
-            if consecutive_reached > 0:
-                cv2.putText(frame, f"Ziel erreicht: {consecutive_reached}/{int(args.stable_frames)} Frames",
-                            (w//2 - 220, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, target_color, 2)
+            if consecutive > 0:
+                progress_pct = min(100, int(consecutive / stable_needed * 100))
+                cv2.putText(frame, f"Ziel: {consecutive}/{stable_needed} ({progress_pct}%)",
+                            (w // 2 - 180, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.85, target_color, 2)
 
-            if (not power_off_sent) and consecutive_reached >= int(args.stable_frames):
-                if shelly is None:
-                    last_shelly_status = "Shelly: nicht konfiguriert (kein OFF gesendet)"
-                    power_off_sent = True
-                else:
+            if consecutive >= stable_needed:
+                if shelly is not None:
                     ok, msg = shelly.set_power(False)
-                    last_shelly_status = "Shelly: AUS ✅" if ok else f"Shelly OFF Fehler: {msg}"
-                    power_off_sent = True
-                    session_active = False
-                    session_started_at = None
-                    consecutive_reached = 0
-                    cv2.putText(frame, ">>> STROM AUS - TOAST SOLLTE AUSWERFEN <<<", (w//2 - 330, 85),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 0, 255), 2)
-        
-        # Warnung bei verbrannt
-        if pred_class in ['dunkel', 'verbrannt'] and confidence > 60:
-            cv2.putText(frame, "!!! ACHTUNG - ZU DUNKEL !!!", (w//2 - 200, 50),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
-        
+                    shelly_status = "Shelly: AUS  (Toast fertig!)" if ok else f"Shelly OFF Fehler: {msg}"
+                else:
+                    shelly_status = "TOAST FERTIG! (kein Shelly konfiguriert)"
+                power_off_sent = True
+                session_active = False
+                consecutive = 0
+
+        if power_off_sent:
+            cv2.putText(frame, "STROM AUS - TOAST FERTIG!", (w // 2 - 250, 80),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+
+        # Safety warning
+        if pred_class == 'verbrannt' and confidence > 50:
+            cv2.putText(frame, "!!! ACHTUNG VERBRANNT !!!", (w // 2 - 200, h - 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 3)
+
         cv2.imshow("Toast AI - Live Erkennung", frame)
-        
+
+        # ---- Key handling ----
         key = cv2.waitKey(1) & 0xFF
-        if key == 27:
+        if key == 27:  # ESC
             break
 
-        # Zielstufe live setzen
         if key in [ord('1'), ord('2'), ord('3'), ord('4'), ord('5')]:
             target_idx = int(chr(key)) - 1
-            consecutive_reached = 0
+            consecutive = 0
             power_off_sent = False
 
-        # Auto-Off an/aus
-        elif key == ord('a'):
-            auto_off_enabled = not auto_off_enabled
-            if not auto_off_enabled:
-                session_active = False
-                session_started_at = None
-                consecutive_reached = 0
-
-        # Session Start (Shelly ON + reset)
         elif key == ord(' '):
-            if auto_off_enabled:
-                power_off_sent = False
-                consecutive_reached = 0
-                session_active = True
-                session_started_at = time.time()
-                if shelly is None:
-                    last_shelly_status = "Shelly: nicht konfiguriert (kann nicht EIN schalten)"
-                else:
-                    ok, msg = shelly.set_power(True)
-                    last_shelly_status = "Shelly: EIN ✅" if ok else f"Shelly ON Fehler: {msg}"
-
-        # Manuelle Shelly Steuerung
-        elif key == ord('o'):
-            if shelly is None:
-                last_shelly_status = "Shelly: nicht konfiguriert"
-            else:
+            power_off_sent = False
+            consecutive = 0
+            session_active = True
+            if shelly is not None:
                 ok, msg = shelly.set_power(True)
-                last_shelly_status = "Shelly: EIN ✅" if ok else f"Shelly ON Fehler: {msg}"
+                shelly_status = "Shelly: EIN (Session gestartet)" if ok else f"Shelly ON Fehler: {msg}"
+            else:
+                shelly_status = "Session gestartet (kein Shelly)"
+
+        elif key == ord('o'):
+            if shelly is not None:
+                ok, msg = shelly.set_power(True)
+                shelly_status = "Shelly: EIN" if ok else f"Shelly ON Fehler: {msg}"
 
         elif key == ord('f'):
-            if shelly is None:
-                last_shelly_status = "Shelly: nicht konfiguriert"
-            else:
+            if shelly is not None:
                 ok, msg = shelly.set_power(False)
-                last_shelly_status = "Shelly: AUS ✅" if ok else f"Shelly OFF Fehler: {msg}"
-                session_active = False
-                session_started_at = None
-                consecutive_reached = 0
-                power_off_sent = False
-
-        # Trigger reset
-        elif key == ord('r'):
-            consecutive_reached = 0
+                shelly_status = "Shelly: AUS" if ok else f"Shelly OFF Fehler: {msg}"
+            session_active = False
+            consecutive = 0
             power_off_sent = False
 
-        # Anzeige: Farbe / S/W
+        elif key == ord('r'):
+            consecutive = 0
+            power_off_sent = False
+
         elif key == ord('g'):
             grayscale_mode = not grayscale_mode
-    
+
     cap.release()
     cv2.destroyAllWindows()
-    print("\n👋 Beendet.")
+    print("\nBeendet.")
+
 
 if __name__ == "__main__":
     main()
